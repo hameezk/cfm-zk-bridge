@@ -48,23 +48,41 @@ def sync_users_from_firebase():
         users_ref = db.collection('users').stream()
         
         with sqlite3.connect(DB_PATH) as conn:
+            # Clear old mappings to prevent stale ID data
+            conn.execute("DELETE FROM users")
+            
             for doc in users_ref:
                 data = doc.to_dict()
-                firebase_id = doc.id 
+                firebase_doc_id = doc.id 
+                emp_id_field = data.get("employeeId") # Pulling from the field, not doc.id
+                
+                if not emp_id_field:
+                    print(f"⚠️ Skipping: User document {firebase_doc_id} has no 'employeeId' field.")
+                    continue
                 
                 try:
-                    # Extract last 3 chars (e.g., 'CFMQA023' -> '023' -> 23 -> '23')
-                    device_id = str(int(firebase_id[-3:]))
+                    # Clean the employeeId (removes spaces/special chars) and get digits
+                    # We take the last 3 digits, then convert to int to drop leading zeros
+                    # Example: "CFM-0022" -> "022" -> 22 -> "22"
+                    # Example: "111" -> "111" -> 111 -> "111"
+                    
+                    suffix = str(emp_id_field)[-3:] 
+                    device_id = str(int(suffix)) 
+                    
                     name = data.get('name', 'Unknown')
                     shift_timing = data.get('shiftTiming', '')
                     
                     conn.execute('''
                         INSERT OR REPLACE INTO users (device_id, firebase_id, name, shift_timing)
                         VALUES (?, ?, ?, ?)
-                    ''', (device_id, firebase_id, name, shift_timing))
+                    ''', (device_id, firebase_doc_id, name, shift_timing))
                     
-                except ValueError:
-                    print(f"⚠️ Skipping user {firebase_id}: Cannot parse last 3 characters to integer.")
+                    print(f"🔗 Mapped: EmployeeId '{emp_id_field}' -> Device ID '{device_id}' (Doc: {firebase_doc_id})")
+                    
+                except (ValueError, TypeError) as e:
+                    print(f"⚠️ Could not parse ID for {emp_id_field}: {e}")
+            
+            conn.commit()
         print("✅ User sync complete.")
     except Exception as e:
         print(f"❌ Error syncing users: {e}")
@@ -130,6 +148,7 @@ def sync_to_firebase():
                     
                     if user_record:
                         firebase_user_id = user_record['firebase_id']
+                        print(f"✅ Found mapping: Device {zk_id} -> Firebase {firebase_user_id}")
                     else:
                         print(f"⚠️ Warning: Device ID {zk_id} not found in local user cache. Skipping sync.")
                         continue 
