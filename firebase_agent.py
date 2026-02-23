@@ -2,6 +2,7 @@ import time
 import sqlite3
 import threading
 import firebase_admin
+import re # Added regex library for robust string parsing
 from firebase_admin import credentials, firestore
 from zk import ZK
 from datetime import datetime, timedelta
@@ -42,7 +43,7 @@ def init_local_db():
         ''')
 
 def sync_users_from_firebase():
-    """Fetches users from Firestore, extracts IDs, and caches them locally."""
+    """Fetches users from Firestore, extracts IDs safely, and caches them locally."""
     print("🔄 Fetching users from Firebase...")
     try:
         users_ref = db.collection('users').stream()
@@ -54,20 +55,23 @@ def sync_users_from_firebase():
             for doc in users_ref:
                 data = doc.to_dict()
                 firebase_doc_id = doc.id 
-                emp_id_field = data.get("employeeId") # Pulling from the field, not doc.id
+                emp_id_field = data.get("employeeId") 
                 
                 if not emp_id_field:
                     print(f"⚠️ Skipping: User document {firebase_doc_id} has no 'employeeId' field.")
                     continue
                 
                 try:
-                    # Clean the employeeId (removes spaces/special chars) and get digits
-                    # We take the last 3 digits, then convert to int to drop leading zeros
-                    # Example: "CFM-0022" -> "022" -> 22 -> "22"
-                    # Example: "111" -> "111" -> 111 -> "111"
+                    # 1. Strip all non-numeric characters using regex
+                    # "CFMQA023" -> "023", "CFM-23" -> "23", "Emp1" -> "1"
+                    digits_only = re.sub(r'\D', '', str(emp_id_field))
                     
-                    suffix = str(emp_id_field)[-3:] 
-                    device_id = str(int(suffix)) 
+                    if not digits_only:
+                        print(f"⚠️ Skipping: 'employeeId' ({emp_id_field}) contains no numbers.")
+                        continue
+                        
+                    # 2. Convert to int to drop leading zeros, then back to string
+                    device_id = str(int(digits_only)) 
                     
                     name = data.get('name', 'Unknown')
                     shift_timing = data.get('shiftTiming', '')
@@ -79,7 +83,7 @@ def sync_users_from_firebase():
                     
                     print(f"🔗 Mapped: EmployeeId '{emp_id_field}' -> Device ID '{device_id}' (Doc: {firebase_doc_id})")
                     
-                except (ValueError, TypeError) as e:
+                except Exception as e:
                     print(f"⚠️ Could not parse ID for {emp_id_field}: {e}")
             
             conn.commit()
@@ -148,7 +152,6 @@ def sync_to_firebase():
                     
                     if user_record:
                         firebase_user_id = user_record['firebase_id']
-                        print(f"✅ Found mapping: Device {zk_id} -> Firebase {firebase_user_id}")
                     else:
                         print(f"⚠️ Warning: Device ID {zk_id} not found in local user cache. Skipping sync.")
                         continue 
