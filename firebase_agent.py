@@ -2,7 +2,7 @@ import time
 import sqlite3
 import threading
 import firebase_admin
-import re # Added regex library for robust string parsing
+import re
 from firebase_admin import credentials, firestore
 from zk import ZK
 from datetime import datetime, timedelta
@@ -49,30 +49,27 @@ def sync_users_from_firebase():
         users_ref = db.collection('users').stream()
         
         with sqlite3.connect(DB_PATH) as conn:
-            # Clear old mappings to prevent stale ID data
             conn.execute("DELETE FROM users")
             
             for doc in users_ref:
                 data = doc.to_dict()
                 firebase_doc_id = doc.id 
-                emp_id_field = data.get("employeeId") 
+                
+                # Fallbacks added just in case of slight typos in Firebase fields
+                emp_id_field = data.get("employeeId") or data.get("employeeID") or data.get("EmployeeId")
                 
                 if not emp_id_field:
-                    print(f"⚠️ Skipping: User document {firebase_doc_id} has no 'employeeId' field.")
                     continue
                 
                 try:
-                    # 1. Strip all non-numeric characters using regex
-                    # "CFMQA023" -> "023", "CFM-23" -> "23", "Emp1" -> "1"
+                    # Strip all non-numeric characters using regex
                     digits_only = re.sub(r'\D', '', str(emp_id_field))
                     
                     if not digits_only:
-                        print(f"⚠️ Skipping: 'employeeId' ({emp_id_field}) contains no numbers.")
                         continue
                         
-                    # 2. Convert to int to drop leading zeros, then back to string
+                    # Convert to int to drop leading zeros, then back to string
                     device_id = str(int(digits_only)) 
-                    
                     name = data.get('name', 'Unknown')
                     shift_timing = data.get('shiftTiming', '')
                     
@@ -81,7 +78,7 @@ def sync_users_from_firebase():
                         VALUES (?, ?, ?, ?)
                     ''', (device_id, firebase_doc_id, name, shift_timing))
                     
-                    print(f"🔗 Mapped: EmployeeId '{emp_id_field}' -> Device ID '{device_id}' (Doc: {firebase_doc_id})")
+                    print(f"🔗 Mapped: Firebase EmployeeId '{emp_id_field}' -> Local Device ID '{device_id}'")
                     
                 except Exception as e:
                     print(f"⚠️ Could not parse ID for {emp_id_field}: {e}")
@@ -109,20 +106,25 @@ def schedule_daily_user_sync():
 def save_locally(user_id, timestamp, status, punch_type):
     """Saves raw data to local disk immediately."""
     try:
+        # BUG FIX: The pyzk library often returns user_id with invisible null bytes (\x00).
+        # We must strip all non-digits from the machine's ID before saving it to the database.
+        clean_user_id = re.sub(r'\D', '', str(user_id))
+        
+        if not clean_user_id:
+            print(f"⚠️ Warning: Captured blank or invalid user ID from device: '{user_id}'")
+            return
+            
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
                 "INSERT INTO attendance (user_id, timestamp, status, punch_type) VALUES (?, ?, ?, ?)",
-                (user_id, str(timestamp), status, punch_type)
+                (clean_user_id, str(timestamp), status, punch_type)
             )
-        print(f"💾 Buffered: Device User {user_id} at {timestamp}")
+        print(f"💾 Buffered: Device User '{clean_user_id}' at {timestamp}")
     except Exception as e:
         print(f"❌ Database Error: {e}")
 
 def get_business_date(punch_time):
-    """
-    Business Day Logic: 6:00 PM to 5:59 PM next day.
-    If a punch is before 18:00 (6:00 PM), it belongs to the previous day's shift.
-    """
+    """Business Day Logic: 6:00 PM to 5:59 PM next day."""
     if punch_time.hour < 18:
         return (punch_time - timedelta(days=1)).date()
     return punch_time.date()
@@ -144,7 +146,17 @@ def sync_to_firebase():
                     continue
 
                 for row in rows:
-                    zk_id = str(row['user_id'])
+                    raw_db_id = str(row['user_id'])
+                    
+                    # BUG FIX: Clean the ID pulled from historical records in the local DB.
+                    # This ensures old punches saved with null bytes will now process correctly.
+                    zk_id = re.sub(r'\D', '', raw_db_id)
+                    
+                    if not zk_id:
+                        print(f"⚠️ Corrupted record found (ID: {row['id']}). Marking as synced to skip.")
+                        conn.execute("UPDATE attendance SET synced = 1 WHERE id = ?", (row['id'],))
+                        conn.commit()
+                        continue
                     
                     # Look up Firebase ID from local DB
                     cursor.execute("SELECT firebase_id FROM users WHERE device_id = ?", (zk_id,))
@@ -153,16 +165,14 @@ def sync_to_firebase():
                     if user_record:
                         firebase_user_id = user_record['firebase_id']
                     else:
-                        print(f"⚠️ Warning: Device ID {zk_id} not found in local user cache. Skipping sync.")
+                        print(f"⚠️ Warning: Device ID '{zk_id}' not found in local user cache. Skipping sync.")
                         continue 
                         
                     punch_time = datetime.strptime(row['timestamp'], "%Y-%m-%d %H:%M:%S")
-                    
-                    # Calculate Global Business Date
                     business_date = get_business_date(punch_time)
                     date_str = business_date.strftime('%Y-%m-%d')
-                    doc_id = f"{firebase_user_id}_{date_str}" 
                     
+                    doc_id = f"{firebase_user_id}_{date_str}" 
                     is_check_in = (row['status'] == 0)
                     
                     update_data = {
@@ -181,7 +191,7 @@ def sync_to_firebase():
 
                     # Upsert to Firestore
                     db.collection('attendance').document(doc_id).set(update_data, merge=True)
-                    print(f"🚀 Synced: {firebase_user_id} | {action} | Doc: {doc_id}")
+                    print(f"🚀 Synced: Firebase ID '{firebase_user_id}' | {action} | Doc: {doc_id}")
 
                     # Mark as synced
                     conn.execute("UPDATE attendance SET synced = 1 WHERE id = ?", (row['id'],))
