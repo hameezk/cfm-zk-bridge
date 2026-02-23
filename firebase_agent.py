@@ -21,6 +21,7 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 def init_local_db():
+    """Creates the local SQLite buffer and Users cache if they don't exist."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute('''
             CREATE TABLE IF NOT EXISTS attendance (
@@ -42,34 +43,37 @@ def init_local_db():
         ''')
 
 def sync_users_from_firebase():
+    """Fetches users from Firestore, extracts IDs safely, and caches them locally."""
     print("\n[DEBUG] 🔄 Starting Firebase User Sync...")
     try:
-        users_ref = db.collection('users').stream()
+        # 1. Fetch data from Firebase FIRST before touching the local database
+        users_docs = list(db.collection('users').stream())
         
+        if not users_docs:
+            print("⚠️ [DEBUG] No users found in Firebase or internet is down. Keeping existing local cache.")
+            return
+
         with sqlite3.connect(DB_PATH) as conn:
+            # 2. Only clear the cache AFTER we successfully have the Firebase data
             conn.execute("DELETE FROM users")
             
-            for doc in users_ref:
+            for doc in users_docs:
                 data = doc.to_dict()
                 firebase_doc_id = doc.id 
                 
                 emp_id_field = data.get("employeeId") or data.get("employeeID") or data.get("EmployeeId")
-                print(f"[DEBUG] Firebase Doc: {firebase_doc_id} | Raw emp_id_field: {repr(emp_id_field)}")
                 
                 if not emp_id_field:
-                    print(f"[DEBUG] -> Skipping: No employeeId found.")
                     continue
                 
                 try:
+                    # Strip all non-numeric characters using regex
                     digits_only = re.sub(r'\D', '', str(emp_id_field))
-                    print(f"[DEBUG] -> Cleaned digits_only: {repr(digits_only)}")
-                    
                     if not digits_only:
                         continue
                         
+                    # Convert to int to drop leading zeros, then back to string
                     device_id = str(int(digits_only)) 
-                    print(f"[DEBUG] -> Final calculated device_id: {repr(device_id)} (Type: {type(device_id)})")
-                    
                     name = data.get('name', 'Unknown')
                     shift_timing = data.get('shiftTiming', '')
                     
@@ -83,34 +87,38 @@ def sync_users_from_firebase():
             
             conn.commit()
             
-            # --- DUMP CACHE TO CONSOLE ---
+            # --- DUMP CACHE TO CONSOLE TO VERIFY ---
             cursor = conn.cursor()
-            cursor.execute("SELECT device_id, firebase_id FROM users")
-            all_cached_users = cursor.fetchall()
-            print(f"[DEBUG] ✅ Final Local User Cache Contents: {all_cached_users}")
+            cursor.execute("SELECT device_id FROM users")
+            available_keys = [r[0] for r in cursor.fetchall()]
+            print(f"[DEBUG] ✅ User Sync Complete. Cache currently holds {len(available_keys)} users: {available_keys}")
             
     except Exception as e:
         print(f"❌ [DEBUG] Error syncing users: {e}")
 
 def schedule_daily_user_sync():
+    """Background worker: Calculates time until 6 PM, sleeps, then syncs."""
     while True:
-        sync_users_from_firebase()
         now = datetime.now()
         target = now.replace(hour=18, minute=0, second=0, microsecond=0)
+        
         if now >= target:
             target += timedelta(days=1)
+            
         sleep_seconds = (target - now).total_seconds()
+        print(f"⏳ Next background user sync scheduled in {sleep_seconds/3600:.2f} hours (at 6:00 PM).")
         time.sleep(sleep_seconds)
+        
+        sync_users_from_firebase()
 
 def save_locally(user_id, timestamp, status, punch_type):
+    """Saves raw data to local disk immediately."""
     try:
-        print(f"\n[DEBUG] --- NEW PUNCH CAPTURED ---")
-        print(f"[DEBUG] Raw user_id from hardware: {repr(user_id)} (Type: {type(user_id)})")
-        
+        # Strip all non-digits from the machine's ID before saving it to the database
         clean_user_id = re.sub(r'\D', '', str(user_id))
-        print(f"[DEBUG] Cleaned user_id for DB: {repr(clean_user_id)}")
         
         if not clean_user_id:
+            print(f"⚠️ Warning: Captured blank or invalid user ID from device: '{user_id}'")
             return
             
         with sqlite3.connect(DB_PATH) as conn:
@@ -118,15 +126,21 @@ def save_locally(user_id, timestamp, status, punch_type):
                 "INSERT INTO attendance (user_id, timestamp, status, punch_type) VALUES (?, ?, ?, ?)",
                 (clean_user_id, str(timestamp), status, punch_type)
             )
+        print(f"💾 Buffered: Device User '{clean_user_id}' at {timestamp}")
     except Exception as e:
         print(f"❌ Database Error: {e}")
 
 def get_business_date(punch_time):
+    """
+    Business Day Logic: 6:00 PM to 5:59 PM next day.
+    If a punch is before 18:00 (6:00 PM), it belongs to the previous day's shift.
+    """
     if punch_time.hour < 18:
         return (punch_time - timedelta(days=1)).date()
     return punch_time.date()
 
 def sync_to_firebase():
+    """Background worker: Uploads unsynced records to Firestore."""
     print("☁️  Sync Agent Started...")
     while True:
         try:
@@ -143,18 +157,19 @@ def sync_to_firebase():
 
                 for row in rows:
                     print(f"\n[DEBUG] --- PROCESSING ATTENDANCE ROW ID: {row['id']} ---")
-                    
                     raw_db_id = str(row['user_id'])
-                    print(f"[DEBUG] Raw user_id from attendance table: {repr(raw_db_id)}")
                     
+                    # Clean the ID pulled from historical records in the local DB
                     zk_id = re.sub(r'\D', '', raw_db_id)
                     print(f"[DEBUG] zk_id configured for lookup: {repr(zk_id)}")
                     
-                    # --- DUMP AVAILABLE KEYS ---
-                    cursor.execute("SELECT device_id FROM users")
-                    available_keys = [r['device_id'] for r in cursor.fetchall()]
-                    print(f"[DEBUG] Searching cache... Available device_ids in cache: {available_keys}")
+                    if not zk_id:
+                        print(f"⚠️ Corrupted record found (ID: {row['id']}). Marking as synced to skip.")
+                        conn.execute("UPDATE attendance SET synced = 1 WHERE id = ?", (row['id'],))
+                        conn.commit()
+                        continue
                     
+                    # Look up Firebase ID from local DB
                     cursor.execute("SELECT firebase_id FROM users WHERE device_id = ?", (zk_id,))
                     user_record = cursor.fetchone()
                     
@@ -186,9 +201,11 @@ def sync_to_firebase():
                         update_data["checkOutTime"] = punch_time
                         action = "Check-Out"
 
+                    # Upsert to Firestore
                     db.collection('attendance').document(doc_id).set(update_data, merge=True)
-                    print(f"🚀 Synced: {firebase_user_id} | {action} | Doc: {doc_id}")
+                    print(f"🚀 Synced: Firebase ID '{firebase_user_id}' | {action} | Doc: {doc_id}")
 
+                    # Mark as synced
                     conn.execute("UPDATE attendance SET synced = 1 WHERE id = ?", (row['id'],))
                     conn.commit()
 
@@ -197,6 +214,7 @@ def sync_to_firebase():
             time.sleep(10)
 
 def run_device_listener():
+    """Main Process: Keeps a persistent connection to the K50."""
     zk = ZK(DEVICE_IP, port=DEVICE_PORT, timeout=5, force_udp=False, ommit_ping=False)
     
     while True:
@@ -218,6 +236,7 @@ def run_device_listener():
 
         except Exception as e:
             print(f"❌ Device Connection Lost: {e}")
+            print("🔄 Retrying in 10 seconds...")
             time.sleep(10)
         finally:
             try:
@@ -228,10 +247,16 @@ def run_device_listener():
 if __name__ == "__main__":
     init_local_db()
     
+    # 💥 BOOT FIX: Force the script to fetch users BEFORE starting the attendance threads
+    print("🚀 Booting up: Running initial user sync to populate cache...")
+    sync_users_from_firebase() 
+    
+    # Now that the cache is safely populated, start the background workers
     user_sync_thread = threading.Thread(target=schedule_daily_user_sync, daemon=True)
     user_sync_thread.start()
     
     attendance_sync_thread = threading.Thread(target=sync_to_firebase, daemon=True)
     attendance_sync_thread.start()
     
+    # Start listening to the hardware on the main thread
     run_device_listener()
